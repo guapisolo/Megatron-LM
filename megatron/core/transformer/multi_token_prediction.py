@@ -518,9 +518,12 @@ class MultiTokenPredictionLayer(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, f"multi token prediction + cross attention is not yet supported."
-        assert (
-            packed_seq_params is None
-        ), f"multi token prediction + sequence packing is not yet supported."
+        # Note: Sequence packing support is experimental. The assertion below has been commented out
+        # to allow passing packed_seq_params to the transformer layer. When using this combination,
+        # ensure that loss masks are properly set for the last k+1 tokens of each document.
+        # assert (
+        #     packed_seq_params is None
+        # ), f"multi token prediction + sequence packing is not yet supported."
 
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
@@ -757,6 +760,13 @@ class MultiTokenPredictionBlock(MegatronModule):
         if loss_mask is None:
             # if loss_mask is not provided, use all ones as loss_mask
             loss_mask = torch.ones_like(labels)
+        
+        # Adjust loss mask for packed sequences to handle MTP boundary cases
+        # We need to mask out the last k+1 tokens of each document where k is the MTP depth
+        if packed_seq_params is not None:
+            loss_mask = self._adjust_loss_mask_for_packed_sequences(
+                loss_mask, packed_seq_params, len(self.layers)
+            )
 
         hidden_states_main_model = hidden_states
         for layer_number in range(len(self.layers)):
@@ -890,6 +900,46 @@ class MultiTokenPredictionBlock(MegatronModule):
             return hidden_states
 
         return custom_forward
+
+    def _adjust_loss_mask_for_packed_sequences(
+        self, loss_mask: Tensor, packed_seq_params: PackedSeqParams, num_mtp_layers: int
+    ) -> Tensor:
+        """
+        Adjust the loss mask for packed sequences when using Multi-Token Prediction.
+        
+        For each document in the packed sequence, we need to mask out the last k+1 tokens
+        where k is the number of MTP layers. This is necessary because MTP requires
+        k future tokens for prediction, and at document boundaries, these future tokens
+        would incorrectly come from the next document.
+        
+        Args:
+            loss_mask (Tensor): The original loss mask of shape [s, b]
+            packed_seq_params (PackedSeqParams): Parameters containing document boundaries
+            num_mtp_layers (int): Number of MTP layers (depth of prediction)
+        
+        Returns:
+            Tensor: Adjusted loss mask with boundary tokens masked out
+        """
+        # Clone the loss mask to avoid modifying the original
+        adjusted_mask = loss_mask.clone()
+        
+        # Get the cumulative sequence lengths to identify document boundaries
+        # packed_seq_params.cu_seqlens_q contains the cumulative lengths: [0, len1, len1+len2, ...]
+        if hasattr(packed_seq_params, 'cu_seqlens_q') and packed_seq_params.cu_seqlens_q is not None:
+            cu_seqlens = packed_seq_params.cu_seqlens_q
+            
+            # Process each document in the batch
+            for i in range(len(cu_seqlens) - 1):
+                doc_start = cu_seqlens[i]
+                doc_end = cu_seqlens[i + 1]
+                
+                # Mask out the last num_mtp_layers + 1 tokens of each document
+                # These tokens don't have enough future context for MTP
+                mask_start = max(doc_start, doc_end - num_mtp_layers - 1)
+                if mask_start < doc_end:
+                    adjusted_mask[mask_start:doc_end] = 0
+        
+        return adjusted_mask
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
