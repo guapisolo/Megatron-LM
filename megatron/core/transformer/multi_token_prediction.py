@@ -135,8 +135,6 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     """
 
     if packed_seq_params is not None:
-        if cp_group is not None and cp_group.size() > 1:
-            raise ValueError("CP > 1 and packed sequence are not yet supported together")
         return _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group)
 
     # Standard rolling behavior when CP is not enabled (cp_group is None or size=1)
@@ -211,7 +209,10 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
     
     This function handles rolling for packed sequences by respecting sequence boundaries
     defined in packed_seq_params.cu_seqlens. Rolling is performed within each individual
-    sequence to prevent mixing tokens between different packed sequences.
+    sequence to prevent mixing tokens between different packed sequences. When Context
+    Parallelism (CP) is enabled, each CP rank still receives the full `cu_seqlens` metadata
+    so we slice out the portion of every packed sequence that lives on the current rank and
+    reuse the standard CP boundary exchange to populate the rolling window.
     
     Args:
         tensor (Tensor): The input tensor to roll.
@@ -223,22 +224,76 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor)
     """
-    assert cp_group is None or cp_group.size() == 1, "CP > 1 and packed sequence are not yet supported together"
-    assert dims == -1 or dims == tensor.dim() - 1, "This roll_tensor function with packed sequence only supports rolling the last dimension"
-    assert shifts == -1, "This roll_tensor function with packed sequence only supports negative shifts"
+    assert dims == -1 or dims == tensor.dim() - 1, "Packed sequence roll only supports the last dimension."
+    assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
     cu_seqlens = packed_seq_params.cu_seqlens_q
+    assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
 
-    # Clone the tensor to avoid modifying the original
     rolled_tensor = tensor.clone()
 
-    # For each sequence in the packed batch, roll within its boundaries
+    cp_size = cp_group.size() if cp_group is not None else 1
+    if cp_size == 1:
+        # CP disabled: simply roll inside each packed sequence boundary.
+        for i in range(len(cu_seqlens) - 1):
+            start_idx = cu_seqlens[i]
+            end_idx = cu_seqlens[i + 1]
+            seq_slice = tensor[..., start_idx:end_idx]
+            rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=dims)
+            rolled_seq[..., shifts:] = 0
+            rolled_tensor[..., start_idx:end_idx] = rolled_seq
+        return rolled_tensor, rolled_tensor.sum()
+
+    # CP enabled: each rank owns two chunks per sequence (front and mirrored tail).
+    local_rank = torch.distributed.get_rank(group=cp_group)
+    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+    next_rank = global_ranks[(local_rank + 1) % cp_size]
+    prev_rank = global_ranks[(local_rank - 1) % cp_size]
+    chunk_count = 2 * cp_size
+
+    # NOTE: Each tensor is rolled at most once along this path, so operating on the clone is safe.
     for i in range(len(cu_seqlens) - 1):
         start_idx = cu_seqlens[i]
         end_idx = cu_seqlens[i + 1]
-        seq_slice = tensor[..., start_idx:end_idx]
-        rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=dims)
-        rolled_seq[..., shifts:] = 0
-        rolled_tensor[..., start_idx:end_idx] = rolled_seq
+        
+        local_start_idx = start_idx // cp_size
+        local_end_idx = end_idx // cp_size
+        tensor_slice = rolled_tensor[..., local_start_idx:local_end_idx].clone()
+        
+        local_chunks = tensor_slice.chunk(2, dim=dims)
+        rolled_chunks = [
+            torch.roll(chunk, shifts=shifts, dims=dims) for chunk in local_chunks
+        ]
+
+        tensor_send_list = []
+        tensor_recv_list = []
+        for chunk in rolled_chunks:
+            boundary = chunk.select(dims, shifts).contiguous().clone()
+            tensor_send_list.append(boundary)
+            tensor_recv_list.append(torch.empty_like(boundary))
+
+        ops = []
+        if local_rank != 0:
+            ops.append(torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank))
+            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank))
+        else:
+            tensor_recv_list[1].zero_()
+
+        if local_rank != cp_size - 1:
+            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank))
+            ops.append(torch.distributed.isend(tensor=tensor_send_list[1], dst=next_rank))
+        else:
+            tensor_recv_list[0].copy_(tensor_send_list[1])
+
+        for op in ops:
+            op.wait()
+
+        index = [slice(None)] * rolled_chunks[0].dim()
+        index[dims] = shifts
+        for chunk, recv in zip(rolled_chunks, tensor_recv_list):
+            chunk[tuple(index)] = recv
+
+        seq_result = torch.cat(rolled_chunks, dim=dims)
+        rolled_tensor[..., local_start_idx:local_end_idx] = seq_result
 
     return rolled_tensor, rolled_tensor.sum()
 
