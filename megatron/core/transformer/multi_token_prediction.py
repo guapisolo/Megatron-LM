@@ -223,9 +223,9 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor)
     """
-    # Use padded cu_seqlens if available for CP support, otherwise use regular cu_seqlens
     assert cp_group is None or cp_group.size() == 1, "CP > 1 and packed sequence are not yet supported together"
     assert dims == -1 or dims == tensor.dim() - 1, "This roll_tensor function with packed sequence only supports rolling the last dimension"
+    assert shifts == -1, "This roll_tensor function with packed sequence only supports negative shifts"
     cu_seqlens = packed_seq_params.cu_seqlens_q
 
     # Clone the tensor to avoid modifying the original
@@ -235,39 +235,12 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
     for i in range(len(cu_seqlens) - 1):
         start_idx = cu_seqlens[i]
         end_idx = cu_seqlens[i + 1]
-        seq_len = end_idx - start_idx
-
-        if seq_len <= 0:
-            continue
-
-        # Extract the sequence slice
         seq_slice = tensor[..., start_idx:end_idx]
-
-        # Roll within this sequence
         rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=dims)
-
-        # Zero out the shifted elements at sequence boundaries
-        if shifts < 0:
-            # For negative shifts (left roll), zero out the rightmost elements
-            rolled_seq[..., shifts:] = 0
-        else:
-            # For positive shifts (right roll), zero out the leftmost elements
-            rolled_seq[..., :shifts] = 0
-
-        # Put the rolled sequence back into the tensor
+        rolled_seq[..., shifts:] = 0
         rolled_tensor[..., start_idx:end_idx] = rolled_seq
 
-    # For packed sequences, calculate num_tokens properly by summing across all sequences
-    # This ensures we don't double-count tokens and properly handle sequence boundaries
-    num_tokens = torch.zeros_like(rolled_tensor.sum())
-    for i in range(len(cu_seqlens) - 1):
-        start_idx = cu_seqlens[i]
-        end_idx = cu_seqlens[i + 1]
-        if end_idx > start_idx:
-            seq_sum = rolled_tensor[..., start_idx:end_idx].sum()
-            num_tokens += seq_sum
-
-    return rolled_tensor, num_tokens
+    return rolled_tensor, rolled_tensor.sum()
 
 class MTPLossLoggingHelper:
     """Helper class for logging MTP losses."""
