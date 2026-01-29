@@ -1,29 +1,53 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """
-Megatron Debug Tensor Dumper - Phase 1: Infrastructure and Parallel Adapter
+Megatron Debug Tensor Dumper
 
 This module provides debugging utilities for Megatron-LM distributed training,
 enabling tensor dumping and analysis across multi-dimensional parallelism
 (TP/PP/DP/CP/EP).
 
-Phase 1 Components:
-- ParallelAdapter: Unified interface for accessing Megatron parallel state
+Core Components:
+- dumper: Global singleton for tensor dumping
+- FilterEngine: Multi-dimensional filter for layer/name/iteration
+- StorageBackend: File I/O with async support
+- ParallelAdapter: Unified interface for Megatron parallel state
 - TensorShardingType: Enum for tensor distribution patterns
-- Utility functions for filename parsing and logging
 
 Example:
-    >>> from megatron.core.debug_utils import ParallelAdapter, TensorShardingType
+    >>> from megatron.core.debug_utils import dumper
     >>>
-    >>> # Get parallel state info
-    >>> adapter = ParallelAdapter()
-    >>> info = adapter.get_parallel_info()
-    >>> print(f"TP rank: {info['tp_rank']}/{info['tp_size']}")
+    >>> # Enable and configure
+    >>> dumper.enable = True
+    >>> dumper.on_training_start()
     >>>
-    >>> # Check if should dump based on DP rank
-    >>> if adapter.should_dump_for_dp():
-    ...     print("This rank should dump")
+    >>> # In training loop
+    >>> dumper.on_iteration_start(iteration)
+    >>> dumper.dump("hidden_states", tensor, layer_id=0)
+    >>>
+    >>> # With context
+    >>> with dumper.context(phase="forward"):
+    ...     dumper.dump("attention_output", attn_out)
+
+Environment Variables:
+    MEGATRON_DUMPER_ENABLE: "1" to enable (default: "0")
+    MEGATRON_DUMPER_DIR: Dump directory (default: "/tmp/megatron_dumps")
+    MEGATRON_DUMPER_WRITE_FILE: "1" to write files (default: "1")
+    MEGATRON_DUMPER_DP_RANK_0_ONLY: "1" for DP rank 0 only (default: "1")
+    MEGATRON_DUMPER_ASYNC: "1" for async writes (default: "0")
+    MEGATRON_DUMPER_LAYERS: Layer filter (e.g., "0,1,last")
+    MEGATRON_DUMPER_NAMES: Name filter regex (e.g., "attention|mlp")
+    MEGATRON_DUMPER_ITERATIONS: Iteration filter (e.g., "0,every:100")
 """
+
+# Core dumper
+from .dumper import dumper
+
+# Filter engine
+from .filter_engine import FilterEngine
+
+# Storage backend
+from .storage_backend import StorageBackend
 
 # Metadata exports
 from .metadata import (
@@ -53,6 +77,12 @@ from .utils import (
 )
 
 __all__ = [
+    # Core dumper
+    "dumper",
+    # Filter engine
+    "FilterEngine",
+    # Storage backend
+    "StorageBackend",
     # Metadata
     "TensorShardingType",
     "TENSOR_SHARDING_MAP",
