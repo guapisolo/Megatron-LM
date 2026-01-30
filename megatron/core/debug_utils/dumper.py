@@ -9,11 +9,13 @@ distributed training with multi-dimensional parallelism support.
 
 import json
 import os
+import re
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Dict, Iterator, Optional, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Type, Union
 
 import torch
+import torch.nn as nn
 
 from .filter_engine import FilterEngine
 from .metadata import TensorShardingType, get_sharding_type
@@ -25,6 +27,14 @@ from .utils import (
     get_logger,
     is_distributed_initialized,
 )
+
+DEFAULT_DUMP_POINTS: Tuple[str, ...] = ("post_attention", "post_mlp")
+DUMP_POINT_TO_ATTR: Dict[str, str] = {
+    "pre_attention": "input_layernorm",
+    "post_attention": "self_attention",
+    "post_mlp": "mlp",
+    "post_layernorm": "post_attention_layernorm",
+}
 
 
 class _MegatronDumper:
@@ -72,6 +82,10 @@ class _MegatronDumper:
         self.dump_dp_rank_0_only = os.environ.get("MEGATRON_DUMPER_DP_RANK_0_ONLY", "1") == "1"
         self.log_tensor_stats = os.environ.get("MEGATRON_DUMPER_LOG_STATS", "1") == "1"
 
+        # Phase 3: Advanced features
+        self.aggregate_tp = os.environ.get("MEGATRON_DUMPER_AGGREGATE_TP", "0") == "1"
+        self.dump_gradients_enabled = os.environ.get("MEGATRON_DUMPER_GRADIENTS", "0") == "1"
+
         async_write = os.environ.get("MEGATRON_DUMPER_ASYNC", "0") == "1"
 
         # Initialize components
@@ -92,6 +106,9 @@ class _MegatronDumper:
         self._dump_index = 0
         self._ctx: Dict[str, Any] = {}
         self._session_name: Optional[str] = None
+
+        # Phase 3: Hook management
+        self._hook_handles: List[torch.utils.hooks.RemovableHandle] = []
 
         self._initialized = True
 
@@ -187,6 +204,12 @@ class _MegatronDumper:
         if sharding_type is None and isinstance(value, torch.Tensor):
             sharding_type = get_sharding_type(name)
 
+        tp_aggregated = False
+        if self.aggregate_tp and isinstance(value, torch.Tensor):
+            value, tp_aggregated = self._maybe_aggregate_tp(value, name, sharding_type)
+            if value is None:
+                return
+
         # Build metadata
         metadata = {
             **self._ctx,
@@ -200,6 +223,10 @@ class _MegatronDumper:
 
         if sharding_type is not None:
             metadata["sharding_type"] = sharding_type.value
+
+        # Mark if tensor was aggregated
+        if tp_aggregated:
+            metadata["tp_aggregated"] = True
 
         if isinstance(value, torch.Tensor):
             metadata["shape"] = list(value.shape)
@@ -298,6 +325,318 @@ class _MegatronDumper:
         finally:
             self._ctx = old_ctx
 
+    # ==================== Hook Registration ====================
+
+    def register_transformer_hooks(
+        self,
+        model: nn.Module,
+        layer_class: Optional[Type[nn.Module]] = None,
+        dump_points: Optional[Sequence[str]] = None,
+    ) -> int:
+        """
+        Register forward hooks on transformer layers for automatic tensor dumping.
+
+        This method automatically discovers TransformerLayer modules in the model
+        and registers hooks at specified dump points to capture intermediate tensors.
+
+        Args:
+            model: The Megatron model to register hooks on
+            layer_class: The transformer layer class to hook. If None, attempts
+                to import megatron.core.transformer.TransformerLayer
+            dump_points: List of positions to dump. Supported values:
+                - "pre_attention": Input to self-attention
+                - "post_attention": Output of self-attention
+                - "post_mlp": Output of MLP
+                - "post_layernorm": Output of layer normalization
+                Default: ["post_attention", "post_mlp"]
+
+        Returns:
+            Number of hooks registered.
+
+        Example:
+            >>> from megatron.core.debug_utils import dumper
+            >>> dumper.enable = True
+            >>> dumper.register_transformer_hooks(
+            ...     model,
+            ...     dump_points=["post_attention", "post_mlp"]
+            ... )
+            32  # Returns number of registered hooks
+        """
+        if not self.enable:
+            return 0
+
+        if layer_class is None:
+            layer_class = self._get_transformer_layer_class()
+
+        if dump_points is None:
+            dump_points = list(DEFAULT_DUMP_POINTS)
+        else:
+            dump_points = list(dump_points)
+
+        self._validate_dump_points(dump_points)
+
+        hooks_registered = 0
+        layers_with_hooks = 0
+        for name, module in model.named_modules():
+            if isinstance(module, layer_class):
+                layer_id = self._extract_layer_id(name)
+                num_hooks = self._register_layer_hooks(module, layer_id, dump_points)
+                hooks_registered += num_hooks
+                layers_with_hooks += 1
+
+        self._logger.info(
+            "Registered %d hooks on %d layers",
+            hooks_registered,
+            layers_with_hooks,
+        )
+        return hooks_registered
+
+    def _get_transformer_layer_class(self) -> Type[nn.Module]:
+        """
+        Attempt to import the default TransformerLayer class.
+
+        Returns:
+            The TransformerLayer class.
+        """
+        from megatron.core.transformer import TransformerLayer
+        return TransformerLayer
+
+    def _validate_dump_points(self, dump_points: Sequence[str]) -> None:
+        """
+        Validate dump point names against supported values.
+
+        Args:
+            dump_points: List of dump point identifiers.
+        """
+        unsupported = [point for point in dump_points if point not in DUMP_POINT_TO_ATTR]
+        if unsupported:
+            raise ValueError(f"Unsupported dump points: {', '.join(unsupported)}")
+
+    def _extract_layer_id(self, module_name: str) -> Optional[int]:
+        """
+        Extract layer ID from a module name.
+
+        Supports various naming patterns:
+        - "decoder.layers.5.self_attention" -> 5
+        - "encoder.layer.10.mlp" -> 10
+        - "transformer.layers.0" -> 0
+        - "model.decoder.layers.12.attention" -> 12
+
+        Args:
+            module_name: The full module name from named_modules()
+
+        Returns:
+            The layer ID as an integer, or None if not found.
+
+        Example:
+            >>> dumper._extract_layer_id("decoder.layers.5.self_attention")
+            5
+            >>> dumper._extract_layer_id("encoder.layer.10.mlp")
+            10
+        """
+        # Pattern to match layer indices in module names
+        # Matches patterns like: layers.5, layer.10, blocks.0
+        patterns = [
+            r"layers\.(\d+)",
+            r"layer\.(\d+)",
+            r"blocks\.(\d+)",
+            r"block\.(\d+)",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, module_name)
+            if match:
+                return int(match.group(1))
+
+        return None
+
+    def _register_layer_hooks(
+        self,
+        layer: nn.Module,
+        layer_id: Optional[int],
+        dump_points: Sequence[str],
+    ) -> int:
+        """
+        Register forward hooks for a single transformer layer.
+
+        Args:
+            layer: The transformer layer module
+            layer_id: The layer number (for metadata)
+            dump_points: List of dump point names
+
+        Returns:
+            Number of hooks registered on this layer.
+        """
+        hooks_registered = 0
+
+        def make_hook(
+            point_name: str,
+            lid: Optional[int],
+        ) -> Callable:
+            """Create a forward hook function for a dump point."""
+            def hook(
+                _module: nn.Module,
+                _inputs: Tuple[Any, ...],
+                output: Any,
+            ) -> None:
+                output_tensor = output[0] if isinstance(output, tuple) else output
+
+                # Build tensor name
+                if lid is not None:
+                    name = f"layer_{lid}.{point_name}"
+                else:
+                    name = point_name
+
+                self.dump(
+                    name,
+                    output_tensor,
+                    layer_id=lid,
+                    hook_point=point_name,
+                )
+
+            return hook
+
+        for point in dump_points:
+            attr_name = DUMP_POINT_TO_ATTR[point]
+            submodule = getattr(layer, attr_name)
+            handle = submodule.register_forward_hook(
+                make_hook(point, layer_id)
+            )
+            self._hook_handles.append(handle)
+            hooks_registered += 1
+
+        return hooks_registered
+
+    def remove_all_hooks(self) -> int:
+        """
+        Remove all registered forward hooks.
+
+        Returns:
+            Number of hooks removed.
+
+        Example:
+            >>> dumper.register_transformer_hooks(model)
+            32
+            >>> dumper.remove_all_hooks()
+            32
+        """
+        num_removed = len(self._hook_handles)
+        for handle in self._hook_handles:
+            handle.remove()
+        self._hook_handles.clear()
+        self._logger.info(f"Removed {num_removed} hooks")
+        return num_removed
+
+    # ==================== TP Aggregation ====================
+
+    def _maybe_aggregate_tp(
+        self,
+        tensor: torch.Tensor,
+        name: str,
+        sharding_type: Optional[TensorShardingType],
+    ) -> Tuple[Optional[torch.Tensor], bool]:
+        """
+        Optionally aggregate tensor across TP ranks.
+
+        When aggregate_tp is enabled, this method gathers sharded tensors
+        from all TP ranks. The aggregated tensor is only returned on TP rank 0;
+        other ranks receive None to avoid redundant dumping.
+
+        Args:
+            tensor: The local tensor (possibly a shard)
+            name: Tensor name (used to determine sharding type if not provided)
+            sharding_type: Explicit sharding type, or None to auto-detect
+
+        Returns:
+            Tuple of (tensor_or_none, aggregated_flag).
+
+        Example:
+            >>> # With aggregate_tp=True, TP_COLUMN tensors are gathered
+            >>> aggregated, _ = dumper._maybe_aggregate_tp(
+            ...     local_shard,
+            ...     "self_attention.query",
+            ...     TensorShardingType.TP_COLUMN
+            ... )
+        """
+        if not self.aggregate_tp:
+            return tensor, False
+
+        # Auto-detect sharding type if not provided
+        if sharding_type is None:
+            sharding_type = get_sharding_type(name)
+
+        parallel_info = self._parallel_adapter.get_parallel_info()
+        tp_rank = parallel_info.get("tp_rank", 0)
+        tp_size = parallel_info.get("tp_size", 1)
+
+        # No aggregation needed for single TP rank
+        if tp_size <= 1:
+            return tensor, False
+
+        if sharding_type == TensorShardingType.REPLICATED:
+            # Replicated tensors: only dump on TP rank 0
+            if tp_rank != 0:
+                return None, False
+            return tensor, False
+
+        if sharding_type in (TensorShardingType.TP_COLUMN, TensorShardingType.TP_ROW):
+            # Sharded tensors: gather and only return on TP rank 0
+            aggregated = self._parallel_adapter.gather_across_tp(tensor)
+            if tp_rank != 0:
+                return None, True
+            return aggregated, True
+
+        # Unknown sharding type: return as-is (no aggregation)
+        return tensor, False
+
+    # ==================== Gradient Dump ====================
+
+    def dump_gradients(
+        self,
+        module: nn.Module,
+        name_prefix: str,
+        **kwargs,
+    ) -> int:
+        """
+        Dump gradients of all parameters in a module.
+
+        This is useful for debugging gradient issues such as vanishing/exploding
+        gradients during training.
+
+        Args:
+            module: The module whose parameter gradients to dump
+            name_prefix: Prefix for the gradient tensor names
+            **kwargs: Additional metadata (e.g., layer_id)
+
+        Returns:
+            Number of gradients dumped.
+
+        Example:
+            >>> # After loss.backward()
+            >>> dumper.dump_gradients(
+            ...     model.layers[0].self_attention,
+            ...     "layer_0.attention",
+            ...     layer_id=0
+            ... )
+            4  # Returns number of gradients dumped
+        """
+        if not self.enable or not self.dump_gradients_enabled:
+            return 0
+
+        num_dumped = 0
+        for param_name, param in module.named_parameters():
+            if param.grad is not None:
+                grad_name = f"{name_prefix}.{param_name}.grad"
+                self.dump(
+                    grad_name,
+                    param.grad,
+                    is_gradient=True,
+                    **kwargs,
+                )
+                num_dumped += 1
+
+        return num_dumped
+
     # ==================== Internal Methods ====================
 
     def _build_filepath(self, name: str, metadata: Dict[str, Any]) -> str:
@@ -346,6 +685,8 @@ class _MegatronDumper:
         if parallel_info.get("global_rank", 0) != 0:
             return
 
+        filter_config = self._filter_engine.get_filter_config()
+
         metadata = {
             "session_name": self._session_name,
             "created_at": datetime.now().isoformat(),
@@ -355,8 +696,19 @@ class _MegatronDumper:
                 "dp_rank_0_only": self.dump_dp_rank_0_only,
                 "write_file": self.write_file,
                 "async_write": self._storage.async_write,
+                "aggregate_tp": self.aggregate_tp,
+                "dump_gradients": self.dump_gradients_enabled,
+                "log_tensor_stats": self.log_tensor_stats,
             },
+            "filter_config": filter_config,
         }
+
+        # Try to get Megatron version
+        try:
+            import megatron
+            metadata["megatron_version"] = getattr(megatron, "__version__", "unknown")
+        except ImportError:
+            pass
 
         filepath = os.path.join(
             self.dump_dir,
@@ -412,6 +764,8 @@ class _MegatronDumper:
         self._dump_index = 0
         self._ctx.clear()
         self._session_name = None
+        # Remove all hooks when resetting
+        self.remove_all_hooks()
 
 
 # Global singleton instance

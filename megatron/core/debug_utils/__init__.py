@@ -35,9 +35,16 @@ Environment Variables:
     MEGATRON_DUMPER_WRITE_FILE: "1" to write files (default: "1")
     MEGATRON_DUMPER_DP_RANK_0_ONLY: "1" for DP rank 0 only (default: "1")
     MEGATRON_DUMPER_ASYNC: "1" for async writes (default: "0")
+    MEGATRON_DUMPER_AGGREGATE_TP: "1" to aggregate tensors across TP (default: "0")
+    MEGATRON_DUMPER_GRADIENTS: "1" to enable gradient dumping (default: "0")
     MEGATRON_DUMPER_LAYERS: Layer filter (e.g., "0,1,last")
     MEGATRON_DUMPER_NAMES: Name filter regex (e.g., "attention|mlp")
     MEGATRON_DUMPER_ITERATIONS: Iteration filter (e.g., "0,every:100")
+
+Phase 3 Features:
+    - Hook Registration: Auto-register hooks on TransformerLayer modules
+    - TP Aggregation: Gather sharded tensors across TP ranks
+    - Gradient Dump: Capture parameter gradients after backward pass
 """
 
 # Core dumper

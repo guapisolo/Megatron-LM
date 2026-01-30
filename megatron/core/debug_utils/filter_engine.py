@@ -50,6 +50,8 @@ class FilterEngine:
         """
         self._num_layers = num_layers
         self._layer_filter_str = layer_filter
+        self._name_filter_str = name_filter
+        self._iteration_filter_str = iteration_filter
         self._layer_set: Optional[FrozenSet[int]] = None
         self._has_last_marker = False
 
@@ -271,6 +273,7 @@ class FilterEngine:
         Args:
             name_filter: New name filter regex pattern
         """
+        self._name_filter_str = name_filter
         if name_filter:
             self._name_pattern = re.compile(name_filter)
         else:
@@ -283,6 +286,7 @@ class FilterEngine:
         Args:
             iteration_filter: New iteration filter string
         """
+        self._iteration_filter_str = iteration_filter
         if iteration_filter:
             self._iteration_rules = self._parse_iteration_filter(iteration_filter)
         else:
@@ -297,6 +301,34 @@ class FilterEngine:
     def has_last_marker(self) -> bool:
         """Check if 'last' is in the layer filter."""
         return self._has_last_marker
+
+    def get_filter_config(self) -> Dict[str, Any]:
+        """
+        Return a JSON-serializable filter configuration.
+
+        This is intended for session metadata snapshots.
+        """
+        config: Dict[str, Any] = {}
+        if self._layer_filter_str:
+            config["layer_filter"] = self._layer_filter_str
+        if self._name_filter_str:
+            config["name_filter"] = self._name_filter_str
+        if self._iteration_rules is not None:
+            config["iteration_rules"] = {
+                "specific": sorted(self._iteration_rules.get("specific", set())),
+                "ranges": list(self._iteration_rules.get("ranges", [])),
+                "every": self._iteration_rules.get("every"),
+                "first": self._iteration_rules.get("first"),
+            }
+        return config
+
+    def get_filter_strings(self) -> Dict[str, Optional[str]]:
+        """Return the raw filter strings for restoring state."""
+        return {
+            "layer_filter": self._layer_filter_str,
+            "name_filter": self._name_filter_str,
+            "iteration_filter": self._iteration_filter_str,
+        }
 
     def __repr__(self) -> str:
         parts = []
