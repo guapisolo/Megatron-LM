@@ -9,6 +9,7 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state
+from megatron.core.debug_utils import dumper
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
@@ -296,6 +297,17 @@ def get_embedding_ranks(pp_ranks: List[int]):
     return embedding_ranks
 
 
+def model_provider_with_dumper(
+    pre_process: bool = True,
+    post_process: bool = True,
+    vp_stage: Optional[int] = None,
+) -> GPTModel:
+    model = model_provider(gpt_builder, pre_process, post_process, vp_stage)
+    if dumper.enable:
+        dumper.register_transformer_hooks(model, dump_points=["post_mlp"])
+    return model
+
+
 if __name__ == "__main__":
 
     # Temporary for transition to core datasets
@@ -304,9 +316,12 @@ if __name__ == "__main__":
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
+    if dumper.enable:
+        dumper.on_training_start()
+
     pretrain(
         train_valid_test_datasets_provider,
-        partial(model_provider, gpt_builder),
+        model_provider_with_dumper,
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
