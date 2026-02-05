@@ -182,8 +182,9 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_te_op_fuser: Optional[bool] = False,
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
-    use_kitchen_attention: bool = False,
-    kitchen_attention_backend: str = "sdpa",
+    fallback_to_eager_attn: bool = False,
+    post_self_attn_layernorm: bool = False,
+    post_mlp_layernorm: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -232,77 +233,15 @@ def get_gpt_layer_with_transformer_engine_spec(
         use_te_activation_func=use_te_activation_func,
     )
 
-    if multi_latent_attention:
-        assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
-        linear_q_up_proj = (
-            backend.column_parallel_layer_norm_linear()
-            if qk_layernorm
-            else backend.column_parallel_linear()
-        )
-        linear_kv_up_proj = (
-            backend.column_parallel_layer_norm_linear()
-            if qk_layernorm
-            else backend.column_parallel_linear()
-        )
-        return ModuleSpec(
-            module=TransformerLayer,
-            submodules=TransformerLayerSubmodules(
-                input_layernorm=backend.layer_norm(),
-                self_attention=ModuleSpec(
-                    module=MLASelfAttention,
-                    params={"attn_mask_type": AttnMaskType.causal},
-                    submodules=MLASelfAttentionSubmodules(
-                        linear_q_proj=backend.column_parallel_linear(),
-                        linear_q_down_proj=backend.linear(),
-                        linear_q_up_proj=linear_q_up_proj,
-                        linear_kv_down_proj=backend.linear(),
-                        linear_kv_up_proj=linear_kv_up_proj,
-                        core_attention=backend.core_attention(),
-                        linear_proj=backend.row_parallel_linear(),
-                        q_layernorm=IdentityOp,
-                        kv_layernorm=IdentityOp,
-                    ),
-                ),
-                self_attn_bda=get_bias_dropout_add,
-                pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
-                mlp=mlp,
-                mlp_bda=get_bias_dropout_add,
-            ),
-        )
-    else:
-        qk_norm = backend.layer_norm(for_qk=True)
-        return ModuleSpec(
-            module=TransformerLayer,
-            submodules=TransformerLayerSubmodules(
-                self_attention=ModuleSpec(
-                    module=SelfAttention,
-                    params={"attn_mask_type": AttnMaskType.causal},
-                    submodules=SelfAttentionSubmodules(
-                        linear_qkv=backend.column_parallel_layer_norm_linear(),
-                        core_attention=backend.core_attention(),
-                        linear_proj=backend.row_parallel_linear(),
-                        q_layernorm=(
-                            L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
-                        ),
-                        k_layernorm=(
-                            L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
-                        ),
-                    ),
-                ),
-                self_attn_bda=get_bias_dropout_add,
-                pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
-                mlp=mlp,
-                mlp_bda=get_bias_dropout_add,
-                sharded_state_dict_keys_map={
-                    "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
-                    "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
-                    "mlp.1.basic_ops.0.weight": "mlp.linear_fc1.weight",
-                    "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
-                    "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
-                    "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
-                },
-            ),
-        )
+    return get_transformer_layer_spec_for_backend(
+        backend=backend,
+        attention=attention,
+        mlp=mlp,
+        sharded_state_dict_keys_map=sharded_state_dict_keys_map,
+        normalization=normalization,
+        post_self_attn_layernorm=post_self_attn_layernorm,
+        post_mlp_layernorm=post_mlp_layernorm,
+    )
 
 
 def get_gpt_layer_local_spec(
@@ -364,6 +303,87 @@ def get_gpt_layer_local_spec(
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
     )
 
+    return get_transformer_layer_spec_for_backend(
+        backend=backend,
+        attention=attention,
+        mlp=mlp,
+        sharded_state_dict_keys_map=sharded_state_dict_keys_map,
+        normalization=normalization,
+    )
+
+
+def get_transformer_layer_spec_for_backend(
+    backend: BackendSpecProvider,
+    attention: ModuleSpec,
+    mlp: ModuleSpec,
+    sharded_state_dict_keys_map: Optional[dict] = None,
+    normalization: Optional[str] = None,
+    post_self_attn_layernorm: bool = False,
+    post_mlp_layernorm: bool = False,
+) -> ModuleSpec:
+    """Helper function to get module spec for TransformerLayer"""
+
+    rms_norm = normalization == "RMSNorm"
+
+    input_layernorm = (
+        IdentityOp
+        if attention.metainfo["fuse_input_layernorm"]
+        else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
+    )
+    pre_mlp_layernorm = (
+        IdentityOp
+        if mlp.metainfo["fuse_pre_mlp_layernorm"]
+        else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
+    )
+
+    transformer_layer = ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=input_layernorm,
+            self_attention=attention,
+            self_attn_bda=get_bias_dropout_add,
+            post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
+            pre_mlp_layernorm=pre_mlp_layernorm,
+            mlp=mlp,
+            mlp_bda=get_bias_dropout_add,
+            post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
+            sharded_state_dict_keys_map=sharded_state_dict_keys_map,
+        ),
+    )
+    return transformer_layer
+
+
+def get_attention_module_spec_for_backend(
+    backend: BackendSpecProvider,
+    sharded_state_dict_keys_map: dict,
+    experimental_attention_variant: Optional[str] = None,
+    qk_layernorm: Optional[bool] = False,
+    qk_l2_norm: Optional[bool] = False,
+    multi_latent_attention: Optional[bool] = False,
+    mla_down_proj_use_column_parallel: Optional[bool] = False,
+    normalization: Optional[str] = None,
+    fallback_to_eager_attn: Optional[bool] = False,
+) -> ModuleSpec:
+    """Helper function to get module spec for Attention"""
+
+    if experimental_attention_variant is not None:
+        return get_experimental_attention_variant_module_spec_for_backend(
+            backend,
+            sharded_state_dict_keys_map,
+            experimental_attention_variant,
+            qk_layernorm,
+            qk_l2_norm,
+            multi_latent_attention,
+            mla_down_proj_use_column_parallel,
+            normalization,
+            fallback_to_eager_attn,
+        )
+
+    # Adjust for RMS norm.
+    rms_norm = normalization == "RMSNorm"
+    qk_norm = backend.layer_norm(rms_norm=rms_norm, for_qk=True)
+
+    core_attention = backend.core_attention() if not fallback_to_eager_attn else DotProductAttention
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         return ModuleSpec(
