@@ -201,8 +201,8 @@ class TopKRouter(Router):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
-        from miles.utils.routing_replay import register_routing_replay
-        register_routing_replay(self)
+        from miles.utils.replay_base import routing_replay_manager
+        routing_replay_manager.register_to_module(self, "routing_replay")
 
     def _maintain_float32_expert_bias(self):
         """
