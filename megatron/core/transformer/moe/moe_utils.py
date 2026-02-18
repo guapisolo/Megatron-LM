@@ -701,15 +701,8 @@ def topk_routing_with_score_function(
         else:
             return torch.topk(scores, k=topk, dim=1)
 
-    def compute_topk(scores, topk, num_groups=None, group_topk=None):
-        # Default behavior if no replay is active
-
-        if router_replay is None:
-            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
-        else:
-            return router_replay.get_replay_topk(
-                scores, topk, num_groups, group_topk, _compute_topk
-            )
+    from miles.utils.routing_replay import get_routing_replay_compute_topk
+    compute_topk = get_routing_replay_compute_topk(compute_topk)
 
     if score_function == "softmax":
         if use_pre_softmax:

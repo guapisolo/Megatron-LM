@@ -203,9 +203,8 @@ class TopKRouter(Router):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
-        self.router_replay = None
-        if self.config.moe_enable_routing_replay:
-            self.router_replay = RouterReplay()
+        from miles.utils.routing_replay import register_routing_replay
+        register_routing_replay(self)
 
     def _maintain_float32_expert_bias(self):
         """
