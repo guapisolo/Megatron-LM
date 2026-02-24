@@ -203,9 +203,6 @@ class TopKRouter(Router):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
-        from miles.utils.routing_replay import register_routing_replay
-        register_routing_replay(self)
-
     def _maintain_float32_expert_bias(self):
         """
         Maintain the expert bias in float32.
@@ -581,7 +578,7 @@ class TopKRouter(Router):
                 score_function=self.score_function,
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
-                router_replay=self.router_replay,
+                router_replay=None,
             )
 
         # Apply token dropping to probs and routing_map.
